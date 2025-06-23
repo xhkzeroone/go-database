@@ -3,11 +3,12 @@ package main
 import (
 	"context"
 	"fmt"
+	"time"
+
 	"github.com/google/uuid"
 	"github.com/xhkzeroone/go-database/db"
 	"github.com/xhkzeroone/go-database/repo"
 	"gorm.io/gorm"
-	"time"
 )
 
 // --- Ví dụ sử dụng:
@@ -49,6 +50,18 @@ type UserRepository struct {
 	FindByUserName                     func(ctx context.Context, username string) (*UserModel, error)                                 `repo:"@Query"`
 	FindByUserNameAndEmailOrPartnerId  func(ctx context.Context, username string, email string, partnerId string) (*UserModel, error) `repo:"@Query"`
 	FindAllByEmailOrderByIDDescLimit10 func(ctx context.Context, email string) ([]UserModel, error)                                   `repo:"@Query"`
+
+	// Các hàm test toán tử mới
+	FindByTotalGreaterThan                                  func(ctx context.Context, total int) (*UserModel, error)                `repo:"@Query"`
+	FindByUserNameLike                                      func(ctx context.Context, pattern string) (*UserModel, error)           `repo:"@Query"`
+	FindByTotalLessThanEqualAndStatusNotEqual               func(ctx context.Context, total int, status string) (*UserModel, error) `repo:"@Query"`
+	FindAllByCreatedAtGreaterThanOrderByCreatedAtDescLimit5 func(ctx context.Context, createdAt time.Time) ([]UserModel, error)     `repo:"@Query"`
+
+	// Test toán tử phức tạp
+	FindByStatusIn           func(ctx context.Context, statuses []string) (*UserModel, error)  `repo:"@Query"`
+	FindByCreatedAtBetween   func(ctx context.Context, from, to time.Time) (*UserModel, error) `repo:"@Query"`
+	FindByCreatedAtIsNull    func(ctx context.Context) (*UserModel, error)                     `repo:"@Query"`
+	FindByCreatedAtIsNotNull func(ctx context.Context) (*UserModel, error)                     `repo:"@Query"`
 }
 
 func main() {
@@ -104,6 +117,32 @@ func main() {
 	//fmt.Println(user1, err)
 	//users, err := r.FindAllByEmailOrderByIDDescLimit10(ctx, "test@example.com")
 	//fmt.Println(users, err)
+
+	// Test các hàm dynamic với toán tử mới
+	userGt, err := r.FindByTotalGreaterThan(ctx, 100)
+	fmt.Println("FindByTotalGreaterThan:", userGt, err)
+
+	userLike, err := r.FindByUserNameLike(ctx, "%john%")
+	fmt.Println("FindByUserNameLike:", userLike, err)
+
+	userMix, err := r.FindByTotalLessThanEqualAndStatusNotEqual(ctx, 50, "inactive")
+	fmt.Println("FindByTotalLessThanEqualAndStatusNotEqual:", userMix, err)
+
+	usersRecent, err := r.FindAllByCreatedAtGreaterThanOrderByCreatedAtDescLimit5(ctx, time.Now().AddDate(0, -1, 0))
+	fmt.Println("FindAllByCreatedAtGreaterThanOrderByCreatedAtDescLimit5:", usersRecent, err)
+
+	// Test các toán tử phức tạp
+	userIn, err := r.FindByStatusIn(ctx, []string{"active", "pending"})
+	fmt.Println("FindByStatusIn:", userIn, err)
+
+	userBetween, err := r.FindByCreatedAtBetween(ctx, time.Now().AddDate(0, -1, 0), time.Now())
+	fmt.Println("FindByCreatedAtBetween:", userBetween, err)
+
+	userNull, err := r.FindByCreatedAtIsNull(ctx)
+	fmt.Println("FindByCreatedAtIsNull:", userNull, err)
+
+	userNotNull, err := r.FindByCreatedAtIsNotNull(ctx)
+	fmt.Println("FindByCreatedAtIsNotNull:", userNotNull, err)
 
 	// (GormDB chưa khởi tạo nên ví dụ này chỉ minh họa)
 	fmt.Println("Repository methods injected successfully.")

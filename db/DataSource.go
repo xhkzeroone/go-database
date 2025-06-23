@@ -2,10 +2,12 @@ package db
 
 import (
 	"fmt"
+	"log"
+	"time"
+
 	"gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
-	"log"
 )
 
 type Option func(o *options)
@@ -72,7 +74,11 @@ func WithDebug(debug bool) Option {
 	}
 }
 
+// Open mở kết nối tới database với config và các option
 func Open(cfg *Config, opts ...Option) (*DataSource, error) {
+	if cfg == nil {
+		return nil, fmt.Errorf("config must not be nil")
+	}
 	opt := &options{}
 	for _, o := range opts {
 		o(opt)
@@ -113,6 +119,17 @@ func Open(cfg *Config, opts ...Option) (*DataSource, error) {
 		return nil, err
 	}
 
+	// Pool config (nếu có trong Config)
+	if cfg.MaxOpenConns > 0 {
+		sqlDB.SetMaxOpenConns(cfg.MaxOpenConns)
+	}
+	if cfg.MaxIdleConns > 0 {
+		sqlDB.SetMaxIdleConns(cfg.MaxIdleConns)
+	}
+	if cfg.ConnMaxLifetime > 0 {
+		sqlDB.SetConnMaxLifetime(time.Duration(cfg.ConnMaxLifetime) * time.Second)
+	}
+
 	debugMode := cfg.Debug
 	if opt.debug != nil {
 		debugMode = *opt.debug
@@ -126,10 +143,19 @@ func Open(cfg *Config, opts ...Option) (*DataSource, error) {
 	return &DataSource{DB: db}, nil
 }
 
+// Close đóng kết nối database
 func (p *DataSource) Close() error {
+	if p == nil || p.DB == nil {
+		return nil
+	}
 	sqlDB, err := p.DB.DB()
 	if err != nil {
 		return err
 	}
 	return sqlDB.Close()
 }
+
+// DefaultDSNBuilder hỗ trợ mở rộng driver (ví dụ: sqlite)
+// case "sqlite":
+// 	return sqlite.Open(c.DBName), nil
+// ... existing code ...

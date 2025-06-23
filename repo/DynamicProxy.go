@@ -46,31 +46,87 @@ func parseOrderBy(s string) (field string, direction string) {
 	return s, "ASC"
 }
 
-// parse method name thành các phần where, orderby, limit
-func parseMethodName(methodName string) (*QueryParts, error) {
+// extractSuffixPart tách phần hậu tố (ví dụ: OrderBy, Limit)
+func extractSuffixPart(s, key string) (before, part string) {
+	idx := strings.Index(s, key)
+	if idx >= 0 {
+		return s[:idx], s[idx+len(key):]
+	}
+	return s, ""
+}
+
+// parseWhereConditions tách các điều kiện WHERE (AND/OR, toán tử)
+func parseWhereConditions(methodName string, parseFieldOp func(string) (string, string)) ([]string, []int, error) {
+	orConditions := strings.Split(methodName, "Or")
+	whereClauses := make([]string, 0, len(orConditions))
+	paramCounts := make([]int, 0, len(orConditions))
+
+	for _, orCond := range orConditions {
+		andConditions := strings.Split(orCond, "And")
+		andClauses := make([]string, 0, len(andConditions))
+		countParams := 0
+		for _, andCond := range andConditions {
+			field, op := parseFieldOp(andCond)
+			switch op {
+			case "IN":
+				andClauses = append(andClauses, fmt.Sprintf("%s IN (?)", toSnakeCase(field)))
+				countParams++ // IN nhận 1 tham số là slice
+			case "BETWEEN":
+				andClauses = append(andClauses, fmt.Sprintf("%s BETWEEN ? AND ?", toSnakeCase(field)))
+				countParams += 2 // BETWEEN nhận 2 tham số
+			case "IS NULL", "IS NOT NULL":
+				andClauses = append(andClauses, fmt.Sprintf("%s %s", toSnakeCase(field), op))
+				// IS NULL không nhận tham số
+			default:
+				andClauses = append(andClauses, fmt.Sprintf("%s %s ?", toSnakeCase(field), op))
+				countParams++
+			}
+		}
+		group := "(" + strings.Join(andClauses, " AND ") + ")"
+		whereClauses = append(whereClauses, group)
+		paramCounts = append(paramCounts, countParams)
+	}
+	return whereClauses, paramCounts, nil
+}
+
+func parseMethodName(rawMethodName string) (*QueryParts, error) {
 	const prefix = "FindBy"
-	if !strings.HasPrefix(methodName, prefix) {
+	if !strings.HasPrefix(rawMethodName, prefix) {
 		return nil, fmt.Errorf("method name must start with %s", prefix)
 	}
-	methodName = methodName[len(prefix):]
+	methodName := rawMethodName[len(prefix):]
 
 	qp := &QueryParts{}
 
-	// Tách OrderBy
-	orderByIdx := strings.Index(methodName, "OrderBy")
-	orderByPart := ""
-	if orderByIdx >= 0 {
-		orderByPart = methodName[orderByIdx+len("OrderBy"):]
-		methodName = methodName[:orderByIdx]
+	// Map các hậu tố sang toán tử SQL
+	operatorMap := []struct {
+		Suffix string
+		SQLOp  string
+	}{
+		{"GreaterThanEqual", ">="},
+		{"LessThanEqual", "<="},
+		{"GreaterThan", ">"},
+		{"LessThan", "<"},
+		{"NotEqual", "!="},
+		{"Like", "LIKE"},
+		{"In", "IN"},
+		{"Between", "BETWEEN"},
+		{"IsNull", "IS NULL"},
+		{"IsNotNull", "IS NOT NULL"},
 	}
 
-	// Tách Limit trong phần orderBy
-	limitPart := ""
-	limitIdx := strings.Index(orderByPart, "Limit")
-	if limitIdx >= 0 {
-		limitPart = orderByPart[limitIdx+len("Limit"):]
-		orderByPart = orderByPart[:limitIdx]
+	parseFieldOp := func(part string) (field, op string) {
+		for _, m := range operatorMap {
+			if strings.HasSuffix(part, m.Suffix) {
+				return part[:len(part)-len(m.Suffix)], m.SQLOp
+			}
+		}
+		return part, "="
 	}
+
+	// Tách các phần hậu tố
+	methodName, orderByPart := extractSuffixPart(methodName, "OrderBy")
+	orderByPart, limitPart := extractSuffixPart(orderByPart, "Limit")
 
 	// Parse OrderBy
 	if orderByPart != "" {
@@ -87,21 +143,11 @@ func parseMethodName(methodName string) (*QueryParts, error) {
 		qp.Limit = n
 	}
 
-	// Parse điều kiện WHERE: xử lý AND, OR
-	// Tách OR trước
-	orParts := strings.Split(methodName, "Or")
-	whereClauses := make([]string, 0, len(orParts))
-
-	for _, orPart := range orParts {
-		andParts := strings.Split(orPart, "And")
-		andClauses := make([]string, 0, len(andParts))
-		for _, andPart := range andParts {
-			andClauses = append(andClauses, fmt.Sprintf("%s = ?", toSnakeCase(andPart)))
-		}
-		group := "(" + strings.Join(andClauses, " AND ") + ")"
-		whereClauses = append(whereClauses, group)
+	// Parse WHERE
+	whereClauses, _, err := parseWhereConditions(methodName, parseFieldOp)
+	if err != nil {
+		return nil, err
 	}
-
 	qp.WhereClauses = whereClauses
 
 	return qp, nil
@@ -136,7 +182,7 @@ func (r *Repository[T, ID]) FillFuncFields(repo interface{}) error {
 			return fmt.Errorf("method %s must have context.Context as the first parameter", field.Name)
 		}
 
-		if jpaTag == "@Query" && field.Type.Kind() == reflect.Func {
+		if field.Type.Kind() == reflect.Func {
 			methodName := field.Name
 
 			var qp *QueryParts
@@ -156,7 +202,22 @@ func (r *Repository[T, ID]) FillFuncFields(repo interface{}) error {
 				return err
 			}
 
-			funcType := field.Type
+			// Kiểm tra kiểu trả về của hàm động
+			if funcType.NumOut() != 2 {
+				return fmt.Errorf("method %s phải trả về 2 giá trị (result, error)", methodName)
+			}
+			if funcType.Out(1) != reflect.TypeOf((*error)(nil)).Elem() {
+				return fmt.Errorf("method %s output cuối cùng phải là error", methodName)
+			}
+			if isFindAll {
+				if funcType.Out(0).Kind() != reflect.Slice {
+					return fmt.Errorf("method %s phải trả về slice cho FindAllBy", methodName)
+				}
+			} else {
+				if funcType.Out(0).Kind() != reflect.Ptr {
+					return fmt.Errorf("method %s phải trả về pointer cho FindBy", methodName)
+				}
+			}
 
 			fn := reflect.MakeFunc(funcType, func(args []reflect.Value) (results []reflect.Value) {
 				ctxVal := args[0]
@@ -167,6 +228,18 @@ func (r *Repository[T, ID]) FillFuncFields(repo interface{}) error {
 					params[i-1] = args[i].Interface()
 				}
 
+				// Đếm số lượng ? trong where clause
+				numPlaceholders := strings.Count(strings.Join(qp.WhereClauses, " "), "?")
+				if len(params) != numPlaceholders {
+					results = make([]reflect.Value, funcType.NumOut())
+					err := fmt.Errorf("số lượng tham số truyền vào (%d) không khớp với số lượng điều kiện (%d)", len(params), numPlaceholders)
+					for i := 0; i < funcType.NumOut()-1; i++ {
+						results[i] = reflect.Zero(funcType.Out(i))
+					}
+					results[len(results)-1] = reflect.ValueOf(err)
+					return results
+				}
+
 				dbWithCtx := r.DataSource.WithContext(ctx).Model(new(T))
 
 				if isFindAll {
@@ -174,30 +247,29 @@ func (r *Repository[T, ID]) FillFuncFields(repo interface{}) error {
 					err := buildGormQuery(dbWithCtx, qp, params).Find(&res).Error
 					if err != nil {
 						results = []reflect.Value{
-							reflect.MakeSlice(reflect.SliceOf(reflect.TypeOf((*T)(nil)).Elem()), 0, 0),
+							reflect.MakeSlice(funcType.Out(0), 0, 0),
 							reflect.ValueOf(err),
 						}
 						return results
 					}
-
 					results = []reflect.Value{
 						reflect.ValueOf(res),
-						reflect.Zero(reflect.TypeOf((*error)(nil)).Elem()), // nil
+						reflect.Zero(funcType.Out(1)), // nil error
 					}
 				} else {
-					var res T
-					err := buildGormQuery(dbWithCtx, qp, params).First(&res).Error
+					// Khởi tạo một con trỏ tới kiểu của T
+					resPtr := reflect.New(funcType.Out(0).Elem())
+					err := buildGormQuery(dbWithCtx, qp, params).First(resPtr.Interface()).Error
 					if err != nil {
 						results = []reflect.Value{
-							reflect.Zero(reflect.TypeOf(&res)),
+							reflect.Zero(funcType.Out(0)),
 							reflect.ValueOf(err),
 						}
 						return results
 					}
-
 					results = []reflect.Value{
-						reflect.ValueOf(&res),
-						reflect.Zero(reflect.TypeOf((*error)(nil)).Elem()),
+						resPtr,
+						reflect.Zero(funcType.Out(1)),
 					}
 				}
 
